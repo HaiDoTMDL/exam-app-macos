@@ -1,0 +1,39 @@
+name: Build macOS Client
+
+on:
+  push:
+    branches: [ "main", "master" ] 
+  workflow_dispatch: 
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Cài đặt Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Cài đặt thư viện Client
+      run: |
+        python -m pip install --upgrade pip
+        pip install customtkinter==5.2.2 requests==2.31.0 mss==9.0.1 Pillow==10.2.0
+        pip install pyinstaller
+        
+    - name: Build App bằng Pyinstaller
+      run: pyinstaller --windowed --name="IUH_Exam_Client" exam_client_gui.py
+      
+    - name: Nén giữ nguyên cấu trúc .app
+      # Lệnh này gom nguyên folder .app thành 1 file .zip duy nhất
+      run: |
+        cd dist
+        zip -r IUH_Exam_Client_Mac.zip IUH_Exam_Client.app
+      
+    - name: Đóng gói và Lưu file
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-client-app
+        # Trỏ vào đúng file zip vừa tạo
+        path: dist/IUH_Exam_Client_Mac.zip
