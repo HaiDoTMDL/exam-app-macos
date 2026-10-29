@@ -1,0 +1,158 @@
+name: Build macOS Client (Intel + Apple Silicon, fix Tk 8.6)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: Build ${{ matrix.name }} (Tk 8.6)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Intel
+            runner: macos-15-intel
+            arch: x86_64
+          - name: AppleSilicon
+            runner: macos-15
+            arch: arm64
+
+    steps:
+      - name: Download project source
+        uses: actions/checkout@v4
+
+      - name: Select macOS source file
+        shell: bash
+        run: |
+          if [[ -f client-app-macos/exam_client_gui.py ]]; then
+            echo 'APP_FILE=client-app-macos/exam_client_gui.py' >> "$GITHUB_ENV"
+            echo 'REQ_FILE=client-app-macos/requirements.txt' >> "$GITHUB_ENV"
+          elif [[ -f exam_client_gui.py ]]; then
+            if grep -q 'ctypes.windll' exam_client_gui.py; then
+              echo '::error::Found Windows client in project root; macOS client-app-macos/exam_client_gui.py is required.'
+              exit 1
+            fi
+            echo 'APP_FILE=exam_client_gui.py' >> "$GITHUB_ENV"
+            echo 'REQ_FILE=requirements.txt' >> "$GITHUB_ENV"
+          else
+            echo '::error::macOS exam_client_gui.py not found.'
+            exit 1
+          fi
+
+      # Do not use setup-python's hostedtoolcache build here: it may have
+      # Tcl/Tk dependencies different from those available on students' Macs.
+      - name: Install official python.org Python with bundled Tcl/Tk 8.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/python-3.12.10-macos11.pkg" \
+            'https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg'
+          sudo installer -pkg "$RUNNER_TEMP/python-3.12.10-macos11.pkg" -target /
+          BASE_PY='/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12'
+          "$BASE_PY" -m venv "$RUNNER_TEMP/exam-client-venv"
+          echo "PYTHON=$RUNNER_TEMP/exam-client-venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Check CPU and Tcl/Tk versions before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner architecture: $(uname -m)"
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          "$PYTHON" - <<'PY'
+          import _tkinter
+          import platform
+          import subprocess
+          import tkinter as tk
+          assert _tkinter.TCL_VERSION.startswith('8.6'), _tkinter.TCL_VERSION
+          assert _tkinter.TK_VERSION.startswith('8.6'), _tkinter.TK_VERSION
+          print('Python:', platform.python_version())
+          print('Compiled Tcl/Tk:', _tkinter.TCL_VERSION, _tkinter.TK_VERSION)
+          print('Tkinter extension:', _tkinter.__file__)
+          print(subprocess.check_output(['otool', '-L', _tkinter.__file__], text=True))
+          # Actually loading Tk catches mismatched 8.5/8.6 libraries.
+          root = tk.Tk()
+          root.withdraw()
+          runtime_tk = root.tk.call('package', 'require', 'Tk')
+          print('Runtime Tk:', runtime_tk)
+          assert str(runtime_tk).startswith('8.6'), runtime_tk
+          root.destroy()
+          PY
+
+      - name: Install client dependencies and PyInstaller
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$PYTHON" -m pip install --upgrade pip
+          if [[ -f "$REQ_FILE" ]]; then
+            "$PYTHON" -m pip install -r "$REQ_FILE"
+          else
+            "$PYTHON" -m pip install \
+              customtkinter==5.2.2 requests==2.31.0 mss==9.0.1 Pillow==10.2.0
+          fi
+          "$PYTHON" -m pip install 'pyinstaller==6.22.3'
+
+      # Smoke-test a *frozen* Tk application as well as the build Python.
+      - name: Test bundled Tkinter (8.6)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/tk_smoke.py" <<'PY'
+          import tkinter as tk
+          root = tk.Tk()
+          root.withdraw()
+          assert str(root.tk.call('package', 'require', 'Tk')).startswith('8.6')
+          root.destroy()
+          PY
+          "$PYTHON" -m PyInstaller --noconfirm --clean --windowed \
+            --target-arch '${{ matrix.arch }}' \
+            --name Tk_Smoke "$RUNNER_TEMP/tk_smoke.py"
+          ./dist/Tk_Smoke.app/Contents/MacOS/Tk_Smoke
+          rm -rf dist/Tk_Smoke.app build/Tk_Smoke Tk_Smoke.spec
+
+      - name: Build IUH Exam Client macOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$PYTHON" -m PyInstaller --noconfirm --clean --windowed \
+            --target-arch '${{ matrix.arch }}' \
+            --collect-all customtkinter \
+            --name IUH_Exam_Client \
+            "$APP_FILE"
+
+      - name: Verify app architecture and bundled Tcl/Tk libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP='dist/IUH_Exam_Client.app'
+          BIN="$APP/Contents/MacOS/IUH_Exam_Client"
+          file "$BIN"
+          lipo -archs "$BIN" | grep -qw '${{ matrix.arch }}'
+          echo 'Tcl/Tk dylibs inside packaged app:'
+          find "$APP/Contents" -name 'libtk8.6*.dylib' -o -name 'libtcl8.6*.dylib'
+          find "$APP/Contents" -name 'libtk8.6*.dylib' | grep -q . || {
+            echo '::error::Tk 8.6 dylib missing from app bundle.'; exit 1;
+          }
+          find "$APP/Contents" -name 'libtcl8.6*.dylib' | grep -q . || {
+            echo '::error::Tcl 8.6 dylib missing from app bundle.'; exit 1;
+          }
+
+      - name: Zip app safely preserving symlinks and permissions
+        shell: bash
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/IUH_Exam_Client.app \
+            'dist/IUH_Exam_Client_${{ matrix.name }}.zip'
+
+      - name: Upload macOS build
+        uses: actions/upload-artifact@v4
+        with:
+          name: IUH_Exam_Client_${{ matrix.name }}
+          path: dist/IUH_Exam_Client_${{ matrix.name }}.zip
+          if-no-files-found: error

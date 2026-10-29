@@ -1,0 +1,92 @@
+name: Build macOS Client (Intel + Apple Silicon)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-mac:
+    name: Build for ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Intel
+            runner: macos-15-intel
+            expected_arch: x86_64
+          - name: AppleSilicon
+            runner: macos-15
+            expected_arch: arm64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Select macOS client source
+        shell: bash
+        run: |
+          if [[ -f "client-app-macos/exam_client_gui.py" ]]; then
+            echo "APP_FILE=client-app-macos/exam_client_gui.py" >> "$GITHUB_ENV"
+            echo "REQ_FILE=client-app-macos/requirements.txt" >> "$GITHUB_ENV"
+          elif [[ -f "exam_client_gui.py" ]]; then
+            if grep -q 'ctypes.windll' exam_client_gui.py; then
+              echo "::error::Root exam_client_gui.py is the Windows version. Use client-app-macos/exam_client_gui.py for macOS."
+              exit 1
+            fi
+            echo "APP_FILE=exam_client_gui.py" >> "$GITHUB_ENV"
+            echo "REQ_FILE=requirements.txt" >> "$GITHUB_ENV"
+          else
+            echo "::error::Cannot find the macOS exam_client_gui.py file."
+            exit 1
+          fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      - name: Check runner CPU architecture
+        shell: bash
+        run: |
+          echo "Runner CPU: $(uname -m)"
+          python -c 'import platform; print("Python CPU:", platform.machine())'
+          test "$(uname -m)" = "${{ matrix.expected_arch }}"
+
+      - name: Install application dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r "$REQ_FILE"
+          python -m pip install pyinstaller
+
+      - name: Build macOS .app with PyInstaller
+        shell: bash
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed \
+            --name IUH_Exam_Client "$APP_FILE"
+
+      - name: Verify bundled app architecture
+        shell: bash
+        run: |
+          file dist/IUH_Exam_Client.app/Contents/MacOS/IUH_Exam_Client
+          lipo -archs dist/IUH_Exam_Client.app/Contents/MacOS/IUH_Exam_Client
+          lipo -archs dist/IUH_Exam_Client.app/Contents/MacOS/IUH_Exam_Client | grep -qw "${{ matrix.expected_arch }}"
+
+      - name: Zip the macOS app (preserve app bundle)
+        shell: bash
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/IUH_Exam_Client.app \
+            "dist/IUH_Exam_Client_${{ matrix.name }}.zip"
+
+      - name: Upload built app
+        uses: actions/upload-artifact@v7
+        with:
+          name: IUH_Exam_Client_${{ matrix.name }}
+          path: dist/IUH_Exam_Client_${{ matrix.name }}.zip
+          if-no-files-found: error
